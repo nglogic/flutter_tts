@@ -1,6 +1,8 @@
 package com.tundralabs.fluttertts;
 
 import android.content.Context;
+import android.media.AudioFocusRequest;
+import android.media.AudioManager;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
@@ -11,7 +13,6 @@ import android.speech.tts.Voice;
 import android.util.Log;
 
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.Locale;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
@@ -35,6 +36,32 @@ public class FlutterTtsPlugin implements MethodCallHandler {
     String uuid;
     Bundle bundle;
     private int silencems;
+    private int speech_count = 0;
+    private int loseFocusTimeoutMillis = 1000;
+    private AudioFocusRequest afr;
+    private Runnable loseAudioFocusRunnable = new Runnable() {
+        @Override
+        public void run() {
+            if (tts != null) {
+                if (!tts.isSpeaking()) {
+                    speech_count = 0;
+                    Log.d("tts", "Calling abandonAudioFocus in runnable");
+                    abandonAudioFocus();
+                } else {
+                    if (handler != null) {
+                        handler.postDelayed(loseAudioFocusRunnable, loseFocusTimeoutMillis);
+                    }
+                }
+            }
+        }
+    };
+    private final AudioManager am;
+    private final AudioManager.OnAudioFocusChangeListener afl = new AudioManager.OnAudioFocusChangeListener() {
+        @Override
+        public void onAudioFocusChange(int focusChange) {
+            Log.d("tts", "AudioFocus Changed to: " + focusChange);
+        }
+    };
     private static final String SILENCE_PREFIX = "SIL_";
 
     /**
@@ -43,10 +70,20 @@ public class FlutterTtsPlugin implements MethodCallHandler {
     private FlutterTtsPlugin(Context context, MethodChannel channel) {
         this.channel = channel;
         this.channel.setMethodCallHandler(this);
-
+        this.am = (AudioManager) context.getSystemService(Context.AUDIO_SERVICE);
         handler = new Handler(Looper.getMainLooper());
         bundle = new Bundle();
         tts = new TextToSpeech(context.getApplicationContext(), onInitListener, googleTtsEngine);
+    }
+
+    private void abandonAudioFocus() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) { // 26
+            if (afr != null) {
+                am.abandonAudioFocusRequest(afr);
+            }
+        } else {
+            am.abandonAudioFocus(afl);
+        }
     }
 
     private UtteranceProgressListener utteranceProgressListener =
@@ -58,17 +95,35 @@ public class FlutterTtsPlugin implements MethodCallHandler {
 
                 @Override
                 public void onDone(String utteranceId) {
-                    if (utteranceId != null && utteranceId.startsWith(SILENCE_PREFIX)) return; invokeMethod("speak.onComplete", true);
+                    if (utteranceId != null && utteranceId.startsWith(SILENCE_PREFIX)) return;
+                    speech_count = Math.max(0, speech_count - 1);
+                    Log.d("tts", "speech_count: " + speech_count);
+                    if (speech_count == 0) {
+                        Log.d("tts", "Calling abandonAudioFocus in onDone");
+                        abandonAudioFocus();
+                    } else {
+                        handler.postDelayed(loseAudioFocusRunnable, loseFocusTimeoutMillis);
+                    }
+                    invokeMethod("speak.onComplete", true);
                 }
 
                 @Override
                 @Deprecated
                 public void onError(String utteranceId) {
+                    Log.d("tts", "onError utteranceId:" + utteranceId);
+                    speech_count = 0;
+                    Log.d("tts", "Calling abandonAudioFocus in onError");
+                    abandonAudioFocus();
                     invokeMethod("speak.onError", "Error from TextToSpeech");
                 }
 
                 @Override
                 public void onError(String utteranceId, int errorCode) {
+                    Log.d("tts", "onError utteranceId:"
+                            + utteranceId + " errorCode: " + errorCode);
+                    speech_count = 0;
+                    Log.d("tts", "Calling abandonAudioFocus in onError");
+                    abandonAudioFocus();
                     invokeMethod("speak.onError", "Error from TextToSpeech - " + errorCode);
                 }
             };
@@ -105,7 +160,7 @@ public class FlutterTtsPlugin implements MethodCallHandler {
         //Wait for TTS engine to be ready
         try {
             ttsInitLatch.await();
-        } catch (InterruptedException e){
+        } catch (InterruptedException e) {
             throw new AssertionError("Unexpected Interruption", e);
         }
         if (call.method.equals("speak")) {
@@ -148,7 +203,7 @@ public class FlutterTtsPlugin implements MethodCallHandler {
     }
 
     void setSpeechRate(float rate) {
-        tts.setSpeechRate(rate*2.0f);
+        tts.setSpeechRate(rate * 2.0f);
     }
 
     Boolean isLanguageAvailable(Locale locale) {
@@ -230,15 +285,40 @@ public class FlutterTtsPlugin implements MethodCallHandler {
 
     private void speak(String text) {
         uuid = UUID.randomUUID().toString();
-        if (silencems > 0) {
-            tts.playSilentUtterance(silencems, TextToSpeech.QUEUE_FLUSH, SILENCE_PREFIX + uuid);
-            tts.speak(text, TextToSpeech.QUEUE_ADD, bundle, uuid);
+        int focus_res;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {// 26
+            Log.d("tts", "requestAudioFocus for API 26 and greater");
+            if (afr == null) {
+                afr = new AudioFocusRequest
+                        .Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
+                        .build();
+            }
+            focus_res = am.requestAudioFocus(afr);
         } else {
-            tts.speak(text, TextToSpeech.QUEUE_FLUSH, bundle, uuid);
+            Log.d("tts", "requestAudioFocus for API 8 and greater");
+            focus_res = am.requestAudioFocus(
+                    afl,
+                    AudioManager.STREAM_MUSIC,
+                    AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK
+            );
+        }
+        if (focus_res == AudioManager.AUDIOFOCUS_REQUEST_GRANTED) {
+            int queue_res;
+            if (silencems > 0) {
+                tts.playSilentUtterance(silencems, TextToSpeech.QUEUE_FLUSH, SILENCE_PREFIX + uuid);
+                queue_res = tts.speak(text, TextToSpeech.QUEUE_ADD, bundle, uuid);
+            } else {
+                queue_res = tts.speak(text, TextToSpeech.QUEUE_FLUSH, bundle, uuid);
+            }
+            if (queue_res == TextToSpeech.SUCCESS) {
+                this.speech_count++;
+                Log.d("tts", "Successfully queued TTS, speech_count: " + speech_count);
+            }
         }
     }
 
     private void stop() {
+        speech_count = 0;
         tts.stop();
     }
 
